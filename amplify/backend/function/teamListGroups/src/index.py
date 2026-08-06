@@ -28,7 +28,12 @@ def list_idc_group_membership(groupId):
         )
         all_groups=[]
         for page in paginator:
-            all_groups.extend(page["GroupMemberships"])
+            # The GraphQL Members type expects a list of strings. Returning the raw
+            # membership objects would also leak the CreatedAt/UpdatedAt timestamps that
+            # boto3 deserializes into datetime objects, which the Lambda runtime cannot
+            # marshal into a JSON response.
+            all_groups.extend([membership['MembershipId']
+                               for membership in page["GroupMemberships"]])
         return all_groups
     except ClientError as e:
         print(e.response['Error']['Message'])

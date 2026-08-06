@@ -25,7 +25,12 @@ def list_idc_groups(IdentityStoreId):
         paginator = p.paginate(IdentityStoreId=IdentityStoreId)
         all_groups = []
         for page in paginator:
-            all_groups.extend(page["Groups"])
+            # Only return the attributes declared in the GraphQL schema. The Identity Store
+            # API also returns CreatedAt/UpdatedAt timestamps, which boto3 deserializes into
+            # datetime objects that the Lambda runtime cannot marshal into a JSON response.
+            all_groups.extend([{'GroupId': group['GroupId'],
+                                'DisplayName': group.get('DisplayName', '')}
+                               for group in page["Groups"]])
         return sorted(all_groups, key=itemgetter('DisplayName'))
     except ClientError as e:
         print(e.response['Error']['Message'])
