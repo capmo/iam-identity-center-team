@@ -15,7 +15,7 @@
 #!/usr/bin/env bash
 set -xe
 
-. "./parameters.sh"
+. "./parameters-mgmt.sh"
 
 if [ -z "$TEAM_ACCOUNT" ]; then 
   export AWS_PROFILE=$ORG_MASTER_PROFILE
