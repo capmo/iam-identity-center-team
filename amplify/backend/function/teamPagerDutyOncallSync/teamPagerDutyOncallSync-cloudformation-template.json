@@ -47,7 +47,7 @@
     },
     "ScheduleExpression": {
       "Type": "String",
-      "Default": "rate(12 hours)",
+      "Default": "rate(1 hour)",
       "Description": "EventBridge schedule expression controlling how often the sync runs."
     },
     "DryRun": {

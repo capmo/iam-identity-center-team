@@ -1,6 +1,6 @@
 """Sync PagerDuty on-call responders into an IAM Identity Center group.
 
-Runs on a schedule (every 12 hours by default). Each run:
+Runs on a schedule. Each run:
   1. resolves who is on call for the configured PagerDuty schedule(s) between
      now and now + LOOKAHEAD_HOURS (48h, i.e. "today and tomorrow"),
   2. matches those responders to IAM Identity Center users by email,
@@ -15,6 +15,7 @@ succeeded and at least one responder has been matched.
 import json
 import logging
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,8 +30,10 @@ logger.setLevel(logging.INFO)
 PAGERDUTY_API = "https://api.pagerduty.com"
 PAGERDUTY_PAGE_SIZE = 100
 PAGERDUTY_TIMEOUT = 15
-# Bounds the pagination loop in case the API keeps reporting more pages.
 PAGERDUTY_MAX_PAGES = 50
+PAGERDUTY_RETRY_WAIT_BUDGET = 90
+PAGERDUTY_DEFAULT_RETRY_WAIT = 5
+PAGERDUTY_RETRY_HEADERS = ("ratelimit-reset", "retry-after")
 # Keys accepted when the secret holds JSON rather than a bare token.
 SECRET_TOKEN_KEYS = ("token", "api_token", "pagerduty_token", "PAGERDUTY_TOKEN")
 
@@ -41,6 +44,15 @@ _token_cache = None
 
 class SyncError(Exception):
     """Raised when the sync cannot be completed safely."""
+
+
+class RetryBudget:
+    def __init__(self, seconds=PAGERDUTY_RETRY_WAIT_BUDGET):
+        self.remaining = seconds
+
+    def wait(self, seconds):
+        self.remaining -= seconds
+        time.sleep(seconds)
 
 
 def flag(name, default):
@@ -122,7 +134,21 @@ def get_pagerduty_token(secret_id):
     return token
 
 
-def pagerduty_get(path, params, token):
+def retry_after_seconds(headers):
+    for name in PAGERDUTY_RETRY_HEADERS:
+        raw = headers.get(name) if headers else None
+        if raw is None:
+            continue
+        try:
+            return max(1, int(float(raw)))
+        except (TypeError, ValueError):
+            continue
+    return PAGERDUTY_DEFAULT_RETRY_WAIT
+
+
+def pagerduty_get(path, params, token, budget=None):
+    if budget is None:
+        budget = RetryBudget()
     url = "%s%s?%s" % (
         PAGERDUTY_API,
         path,
@@ -135,29 +161,40 @@ def pagerduty_get(path, params, token):
             "Accept": "application/vnd.pagerduty+json;version=2",
         },
     )
-    try:
-        with urllib.request.urlopen(request, timeout=PAGERDUTY_TIMEOUT) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")[:500]
-        raise SyncError(
-            "PagerDuty GET %s returned %s: %s" % (path, e.code, body)
-        ) from e
-    except urllib.error.URLError as e:
-        raise SyncError("PagerDuty GET %s failed: %s" % (path, e.reason)) from e
+    while True:
+        try:
+            with urllib.request.urlopen(
+                request, timeout=PAGERDUTY_TIMEOUT
+            ) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                wait = retry_after_seconds(e.headers)
+                if wait > budget.remaining:
+                    raise SyncError(
+                        "PagerDuty rate limited GET %s and asked to wait %ss, "
+                        "more than the %ss of waiting left in this run"
+                        % (path, wait, budget.remaining)
+                    ) from e
+                logger.warning(
+                    "PagerDuty rate limited GET %s, retrying in %ss", path, wait
+                )
+                budget.wait(wait)
+                continue
+            body = e.read().decode("utf-8", "replace")[:500]
+            raise SyncError(
+                "PagerDuty GET %s returned %s: %s" % (path, e.code, body)
+            ) from e
+        except urllib.error.URLError as e:
+            raise SyncError("PagerDuty GET %s failed: %s" % (path, e.reason)) from e
 
 
 def get_oncall_responders(schedule_ids, lookahead_hours, token):
-    """Return the distinct responders on call within the lookahead window.
-
-    /oncalls returns every on-call period overlapping the window and already
-    accounts for overrides, so both the current and the next-up responder show
-    up in one call.
-    """
     now = datetime.now(timezone.utc)
     until = now + timedelta(hours=lookahead_hours)
     responders = {}
     offset = 0
+    budget = RetryBudget()
 
     for _ in range(PAGERDUTY_MAX_PAGES):
         payload = pagerduty_get(
@@ -172,6 +209,7 @@ def get_oncall_responders(schedule_ids, lookahead_hours, token):
                 "offset": offset,
             },
             token,
+            budget,
         )
         for entry in payload.get("oncalls", []):
             user = entry.get("user") or {}
