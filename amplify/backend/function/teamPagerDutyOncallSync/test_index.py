@@ -201,6 +201,10 @@ class SyncTestCase(unittest.TestCase):
         ), mock.patch("urllib.request.urlopen", fake_urlopen(*payloads)):
             return index.handler(event if event is not None else {}, None)
 
+    def assert_untouched(self, identitystore):
+        self.assertEqual(identitystore.created, [])
+        self.assertEqual(identitystore.deleted, [])
+
 
 class TestHappyPath(SyncTestCase):
     def test_adds_oncall_and_removes_everyone_else(self):
@@ -363,10 +367,6 @@ class TestDryRun(SyncTestCase):
 
 
 class TestFailClosed(SyncTestCase):
-    def assert_untouched(self, identitystore):
-        self.assertEqual(identitystore.created, [])
-        self.assertEqual(identitystore.deleted, [])
-
     def test_empty_oncall_never_empties_the_group(self):
         identitystore = FakeIdentityStore(
             users=[{"UserId": "u-stale", "UserName": "stale@capmo.de", "Emails": []}],
@@ -627,6 +627,125 @@ class TestRequestShape(SyncTestCase):
         since = datetime.strptime(query["since"][0], "%Y-%m-%dT%H:%M:%SZ")
         until = datetime.strptime(query["until"][0], "%Y-%m-%dT%H:%M:%SZ")
         self.assertEqual((until - since).total_seconds(), 48 * 3600)
+
+
+class TestRateLimitRetry(SyncTestCase):
+    def rate_limited_urlopen(self, reset, then, failures=1):
+        state = {"n": 0}
+        body = json.dumps(then).encode("utf-8")
+
+        def _urlopen(request, timeout=None):
+            state["n"] += 1
+            if state["n"] <= failures:
+                raise urllib.error.HTTPError(
+                    "https://api.pagerduty.com/oncalls",
+                    429,
+                    "Too Many Requests",
+                    {"ratelimit-reset": reset},
+                    io.BytesIO(b'{"error":{"message":"rate limited"}}'),
+                )
+
+            class _Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+                def read(self):
+                    return body
+
+            return _Response()
+
+        _urlopen.state = state
+        return _urlopen
+
+    def test_retries_after_waiting_the_requested_seconds(self):
+        identitystore = FakeIdentityStore(
+            users=[{"UserId": "u-1", "UserName": "oncall@capmo.de", "Emails": []}],
+            memberships={},
+        )
+        urlopen = self.rate_limited_urlopen(
+            "7",
+            oncall_payload(
+                [{"id": "PD1", "name": "Oncall", "email": "oncall@capmo.de"}]
+            ),
+        )
+        slept = []
+
+        session = FakeSession(identitystore)
+        with mock.patch.dict(os.environ, BASE_ENV, clear=False), mock.patch.object(
+            index, "session", session
+        ), mock.patch("urllib.request.urlopen", urlopen), mock.patch.object(
+            index.time, "sleep", slept.append
+        ):
+            summary = index.handler({}, None)
+
+        self.assertEqual(slept, [7])
+        self.assertEqual(urlopen.state["n"], 2)
+        self.assertEqual(summary["added"], ["oncall@capmo.de"])
+
+    def test_wait_longer_than_the_budget_aborts_before_any_write(self):
+        identitystore = FakeIdentityStore(
+            users=[{"UserId": "u-stale", "UserName": "stale@capmo.de", "Emails": []}],
+            memberships={"m-2": "u-stale"},
+        )
+        urlopen = self.rate_limited_urlopen(
+            str(index.PAGERDUTY_RETRY_WAIT_BUDGET + 1), {}
+        )
+        slept = []
+
+        session = FakeSession(identitystore)
+        with mock.patch.dict(os.environ, BASE_ENV, clear=False), mock.patch.object(
+            index, "session", session
+        ), mock.patch("urllib.request.urlopen", urlopen), mock.patch.object(
+            index.time, "sleep", slept.append
+        ):
+            with self.assertRaises(index.SyncError) as ctx:
+                index.handler({}, None)
+
+        self.assertEqual(slept, [])
+        self.assertEqual(urlopen.state["n"], 1)
+        self.assertIn("rate limited", str(ctx.exception))
+        self.assert_untouched(identitystore)
+
+    def test_repeated_rate_limits_stop_once_the_budget_runs_out(self):
+        identitystore = FakeIdentityStore(
+            users=[{"UserId": "u-stale", "UserName": "stale@capmo.de", "Emails": []}],
+            memberships={"m-2": "u-stale"},
+        )
+        urlopen = self.rate_limited_urlopen("60", {}, failures=99)
+        slept = []
+
+        session = FakeSession(identitystore)
+        with mock.patch.dict(os.environ, BASE_ENV, clear=False), mock.patch.object(
+            index, "session", session
+        ), mock.patch("urllib.request.urlopen", urlopen), mock.patch.object(
+            index.time, "sleep", slept.append
+        ):
+            with self.assertRaises(index.SyncError):
+                index.handler({}, None)
+
+        self.assertEqual(slept, [60])
+        self.assert_untouched(identitystore)
+
+    def test_missing_reset_header_falls_back_to_the_default_wait(self):
+        headers = {}
+        self.assertEqual(
+            index.retry_after_seconds(headers), index.PAGERDUTY_DEFAULT_RETRY_WAIT
+        )
+
+    def test_retry_after_header_is_honoured(self):
+        self.assertEqual(index.retry_after_seconds({"retry-after": "12"}), 12)
+
+    def test_unparsable_reset_header_falls_back_to_the_default_wait(self):
+        self.assertEqual(
+            index.retry_after_seconds({"ratelimit-reset": "soon"}),
+            index.PAGERDUTY_DEFAULT_RETRY_WAIT,
+        )
+
+    def test_zero_reset_still_waits_at_least_a_second(self):
+        self.assertEqual(index.retry_after_seconds({"ratelimit-reset": "0"}), 1)
 
 
 if __name__ == "__main__":

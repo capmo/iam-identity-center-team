@@ -203,6 +203,15 @@
     },
     "teamPagerDutyOncallSync": {
       "build": true,
+      "dependsOn": [
+        {
+          "attributes": [
+            "Arn"
+          ],
+          "category": "function",
+          "resourceName": "teamapplicationboto3layer"
+        }
+      ],
       "providerPlugin": "awscloudformation",
       "service": "Lambda"
     },
