@@ -16,6 +16,10 @@
     "s3Key": {
       "Type": "String"
     },
+    "functionteamapplicationboto3layerArn": {
+      "Type": "String",
+      "Default": "functionteamapplicationboto3layerArn"
+    },
     "PagerDutyScheduleIds": {
       "Type": "String",
       "Default": "",
@@ -146,8 +150,12 @@
             "Arn"
           ]
         },
-        "Runtime": "python3.12",
-        "Layers": [],
+        "Runtime": "python3.10",
+        "Layers": [
+          {
+            "Ref": "functionteamapplicationboto3layerArn"
+          }
+        ],
         "MemorySize": 256,
         "Timeout": 300
       }
