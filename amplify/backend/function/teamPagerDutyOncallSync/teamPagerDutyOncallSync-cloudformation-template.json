@@ -321,6 +321,7 @@
         "Targets": [
           {
             "Id": "teamPagerDutyOncallSyncTarget",
+            "Input": "{\"dry_run\": false}",
             "Arn": {
               "Fn::GetAtt": [
                 "LambdaFunction",

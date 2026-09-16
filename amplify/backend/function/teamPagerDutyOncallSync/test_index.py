@@ -8,6 +8,7 @@ Stdlib only, no test runner needed:
 import io
 import json
 import os
+import pathlib
 import sys
 import unittest
 import urllib.error
@@ -364,6 +365,61 @@ class TestDryRun(SyncTestCase):
 
         self.assertTrue(summary["dryRun"])
         self.assertEqual(identitystore.created, [])
+
+    def test_event_turns_off_a_dry_run_environment(self):
+        identitystore = FakeIdentityStore(
+            users=[{"UserId": "u-alice", "UserName": "alice@capmo.de", "Emails": []}],
+            memberships={},
+        )
+        payload = oncall_payload(
+            [{"id": "PD1", "name": "Alice", "email": "alice@capmo.de"}]
+        )
+
+        summary = self.run_handler(
+            identitystore, [payload], env={"DRY_RUN": "true"}, event={"dry_run": False}
+        )
+
+        self.assertFalse(summary["dryRun"])
+        self.assertEqual(identitystore.created, ["u-alice"])
+
+
+class TestScheduledTrigger(SyncTestCase):
+    def scheduled_target(self):
+        template = json.loads(
+            (
+                pathlib.Path(__file__).parent
+                / "teamPagerDutyOncallSync-cloudformation-template.json"
+            ).read_text()
+        )
+        targets = template["Resources"]["OncallSyncScheduleRule"]["Properties"][
+            "Targets"
+        ]
+        self.assertEqual(len(targets), 1)
+        return targets[0]
+
+    def test_target_input_asks_for_a_real_run(self):
+        self.assertEqual(
+            json.loads(self.scheduled_target()["Input"]), {"dry_run": False}
+        )
+
+    def test_target_input_applies_changes_despite_a_dry_run_environment(self):
+        identitystore = FakeIdentityStore(
+            users=[{"UserId": "u-alice", "UserName": "alice@capmo.de", "Emails": []}],
+            memberships={},
+        )
+        payload = oncall_payload(
+            [{"id": "PD1", "name": "Alice", "email": "alice@capmo.de"}]
+        )
+
+        summary = self.run_handler(
+            identitystore,
+            [payload],
+            env={"DRY_RUN": "true"},
+            event=json.loads(self.scheduled_target()["Input"]),
+        )
+
+        self.assertFalse(summary["dryRun"])
+        self.assertEqual(identitystore.created, ["u-alice"])
 
 
 class TestFailClosed(SyncTestCase):
